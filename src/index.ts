@@ -83,7 +83,7 @@ function validateDays(value: unknown): number {
 	if (value === undefined || value === null) return 14;
 	const num = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
 	if (Number.isNaN(num) || num < 1) return 14;
-	return Math.min(num, 90);
+	return Math.min(num, 3650);
 }
 
 function validateBoolean(value: unknown): boolean {
@@ -293,7 +293,7 @@ function createMcpServer(): Server {
 					let stats;
 
 					if (full) {
-						stats = await sync.syncDays(90);
+						stats = await sync.syncDays(3650);
 					} else {
 						const result = await sync.smartSync();
 						if (result.type === 'skip') {
