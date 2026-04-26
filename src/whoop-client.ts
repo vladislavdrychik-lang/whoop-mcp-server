@@ -1,13 +1,13 @@
-// MARKER TESTimport type {
-  WhoopTokens,
-	    WhoopUser,
-	    WhoopBodyMeasurement,
-	    WhoopCycle,
-	    WhoopRecovery,
-	    WhoopSleep,
-	    WhoopWorkout,
-	    WhoopPaginatedResponse,
-	  } from './types.js';
+import type {
+	  WhoopTokens,
+	  WhoopUser,
+	  WhoopBodyMeasurement,
+	  WhoopCycle,
+	  WhoopRecovery,
+	  WhoopSleep,
+	  WhoopWorkout,
+	  WhoopPaginatedResponse,
+} from './types.js';
 
 const WHOOP_API_BASE = 'https://api.prod.whoop.com/developer';
 const WHOOP_AUTH_BASE = 'https://api.prod.whoop.com/oauth/oauth2';
