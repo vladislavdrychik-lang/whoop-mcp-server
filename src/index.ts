@@ -1,265 +1,360 @@
-import Database from 'better-sqlite3';
-import { encrypt, decrypt, isEncrypted } from './crypto.js';
-import type {
-  WhoopTokens,
-  WhoopCycle,
-  WhoopRecovery,
-  WhoopSleep,
-  WhoopWorkout,
-  DbCycle,
-  DbRecovery,
-  DbSleep,
-  DbWorkout,
-} from './types.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import express, { type Request, type Response } from 'express';
+import { WhoopClient } from './whoop-client.js';
+import { WhoopDatabase } from './database.js';
+import { WhoopSync } from './sync.js';
 
-interface TokenRow {
-  id: number;
-  access_token: string;
-  refresh_token: string;
-  expires_at: number;
-  updated_at: string;
+interface ToolArguments {
+  days?: number;
+  full?: boolean;
 }
 
-interface SyncStateRow {
-  id: number;
-  last_sync_at: string | null;
-  oldest_synced_date: string | null;
-  newest_synced_date: string | null;
+const config = {
+  clientId: process.env.WHOOP_CLIENT_ID ?? '',
+  clientSecret: process.env.WHOOP_CLIENT_SECRET ?? '',
+  redirectUri: process.env.WHOOP_REDIRECT_URI ?? 'http://localhost:3000/callback',
+  dbPath: process.env.DB_PATH ?? './whoop.db',
+  port: Number.parseInt(process.env.PORT ?? '3000', 10),
+  mode: process.env.MCP_MODE ?? 'http',
+};
+
+const db = new WhoopDatabase(config.dbPath);
+const client = new WhoopClient({
+  clientId: config.clientId,
+  clientSecret: config.clientSecret,
+  redirectUri: config.redirectUri,
+  onTokenRefresh: tokens => db.saveTokens(tokens),
+});
+const existingTokens = db.getTokens();
+if (existingTokens) {
+  client.setTokens(existingTokens);
 }
 
-interface RecoveryTrendRow {
-  date: string;
-  recovery_score: number;
-  hrv: number;
-  rhr: number;
+const sync = new WhoopSync(client, db);
+
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
+function cleanupStaleSessions(): void {
+  const now = Date.now();
+  for (const [sessionId, session] of transports) {
+    if (now - session.lastAccess > SESSION_TTL_MS) {
+      session.transport.close().catch(() => {});
+      transports.delete(sessionId);
+    }
+  }
+}
+setInterval(cleanupStaleSessions, 5 * 60 * 1000);
+
+function formatDuration(millis: number | null): string {
+  if (!millis) return 'N/A';
+  const hours = Math.floor(millis / 3_600_000);
+  const minutes = Math.floor((millis % 3_600_000) / 60_000);
+  return `${hours}h ${minutes}m`;
 }
 
-interface SleepTrendRow {
-  date: string;
-  total_sleep_hours: number;
-  performance: number;
-  efficiency: number;
+function formatDate(isoString: string): string {
+  return new Date(isoString).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-interface StrainTrendRow {
-  date: string;
-  strain: number;
-  calories: number;
+function getRecoveryZone(score: number): string {
+  if (score >= 67) return 'Green (Well Recovered)';
+  if (score >= 34) return 'Yellow (Moderate)';
+  return 'Red (Needs Rest)';
 }
 
-interface HrZoneTrendRow {
-  month: string;
-  z0: number;
-  z1: number;
-  z2: number;
-  z3: number;
-  z4: number;
-  z5: number;
-  workout_count: number;
-  total_strain: number;
+function getStrainZone(strain: number): string {
+  if (strain >= 18) return 'All Out (18-21)';
+  if (strain >= 14) return 'High (14-17)';
+  if (strain >= 10) return 'Moderate (10-13)';
+  return 'Light (0-9)';
 }
 
-export class WhoopDatabase {
-  private db: Database.Database;
+function validateDays(value: unknown): number {
+  if (value === undefined || value === null) return 14;
+  const num = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
+  if (Number.isNaN(num) || num < 1) return 14;
+  return Math.min(num, 3650);
+}
 
-  constructor(dbPath = './whoop.db') {
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.initSchema();
-  }
+function validateBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true') return true;
+  return false;
+}
 
-  private initSchema(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS tokens (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        access_token TEXT NOT NULL,
-        refresh_token TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS sync_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        last_sync_at TEXT,
-        oldest_synced_date TEXT,
-        newest_synced_date TEXT
-      );
-      CREATE TABLE IF NOT EXISTS cycles (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        start_time TEXT NOT NULL,
-        end_time TEXT,
-        score_state TEXT NOT NULL,
-        strain REAL,
-        kilojoule REAL,
-        avg_hr INTEGER,
-        max_hr INTEGER,
-        synced_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS recovery (
-        id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        sleep_id TEXT,
-        created_at TEXT NOT NULL,
-        score_state TEXT NOT NULL,
-        recovery_score INTEGER,
-        resting_hr INTEGER,
-        hrv_rmssd REAL,
-        spo2 REAL,
-        skin_temp REAL,
-        synced_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS sleep (
-        id TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        cycle_id INTEGER,
-        start_time TEXT NOT NULL,
-        end_time TEXT NOT NULL,
-        is_nap INTEGER NOT NULL DEFAULT 0,
-        score_state TEXT NOT NULL,
-        total_in_bed_milli INTEGER,
-        total_awake_milli INTEGER,
-        total_light_milli INTEGER,
-        total_deep_milli INTEGER,
-        total_rem_milli INTEGER,
-        sleep_performance REAL,
-        sleep_efficiency REAL,
-        sleep_consistency REAL,
-        respiratory_rate REAL,
-        sleep_needed_baseline_milli INTEGER,
-        sleep_needed_debt_milli INTEGER,
-        sleep_needed_strain_milli INTEGER,
-        synced_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS workouts (
-        id TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        sport_id INTEGER NOT NULL,
-        start_time TEXT NOT NULL,
-        end_time TEXT NOT NULL,
-        score_state TEXT NOT NULL,
-        strain REAL,
-        avg_hr INTEGER,
-        max_hr INTEGER,
-        kilojoule REAL,
-        zone_zero_milli INTEGER,
-        zone_one_milli INTEGER,
-        zone_two_milli INTEGER,
-        zone_three_milli INTEGER,
-        zone_four_milli INTEGER,
-        zone_five_milli INTEGER,
-        synced_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS idx_cycles_start ON cycles(start_time);
-      CREATE INDEX IF NOT EXISTS idx_recovery_created ON recovery(created_at);
-      CREATE INDEX IF NOT EXISTS idx_sleep_start ON sleep(start_time);
-      CREATE INDEX IF NOT EXISTS idx_workouts_start ON workouts(start_time);
-      INSERT OR IGNORE INTO sync_state (id) VALUES (1);
-    `);
-  }
+function createMcpServer(): Server {
+  const server = new Server({ name: 'whoop-mcp-server', version: '1.0.0' }, { capabilities: { tools: {} } });
 
-  saveTokens(tokens: WhoopTokens): void {
-    const encryptedAccess = encrypt(tokens.access_token);
-    const encryptedRefresh = encrypt(tokens.refresh_token);
-    this.db.prepare(`INSERT OR REPLACE INTO tokens (id, access_token, refresh_token, expires_at, updated_at) VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)`).run(encryptedAccess, encryptedRefresh, tokens.expires_at);
-  }
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      { name: 'get_today', description: "Get today's Whoop data including recovery score, last night's sleep, and current strain.", inputSchema: { type: 'object', properties: {}, required: [] } },
+      { name: 'get_recovery_trends', description: 'Get recovery score trends over time, including HRV and resting heart rate patterns.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
+      { name: 'get_sleep_analysis', description: 'Get detailed sleep analysis including duration, stages, efficiency, and sleep debt.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
+      { name: 'get_strain_history', description: 'Get training strain history and workout data.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
+      { name: 'get_hr_zones', description: 'Get monthly HR zone time distribution (Z0-Z5) from workouts. Critical for VO2max + Z2 base analysis.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 90, max: 3650)' } }, required: [] } },
+      { name: 'sync_data', description: 'Manually trigger a data sync from Whoop.', inputSchema: { type: 'object', properties: { full: { type: 'boolean', description: 'Force a full historical sync (default: false)' } }, required: [] } },
+      { name: 'get_auth_url', description: 'Get the Whoop authorization URL to connect your account.', inputSchema: { type: 'object', properties: {}, required: [] } },
+    ],
+  }));
 
-  getTokens(): WhoopTokens | null {
-    const row = this.db.prepare('SELECT * FROM tokens WHERE id = 1').get() as TokenRow | undefined;
-    if (!row) return null;
-    const accessToken = isEncrypted(row.access_token) ? decrypt(row.access_token) : row.access_token;
-    const refreshToken = isEncrypted(row.refresh_token) ? decrypt(row.refresh_token) : row.refresh_token;
-    return { access_token: accessToken, refresh_token: refreshToken, expires_at: row.expires_at };
-  }
+  server.setRequestHandler(CallToolRequestSchema, async request => {
+    const { name, arguments: args } = request.params;
+    const typedArgs = (args ?? {}) as ToolArguments;
+    try {
+      const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history', 'get_hr_zones'];
+      if (dataTools.includes(name)) {
+        const tokens = db.getTokens();
+        if (!tokens) {
+          return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Use get_auth_url to authorize first.' }] };
+        }
+        client.setTokens(tokens);
+        try {
+          await sync.smartSync();
+        } catch {
+          // Continue with cached data
+        }
+      }
 
-  getSyncState(): { lastSyncAt: string | null; oldestDate: string | null; newestDate: string | null } {
-    const row = this.db.prepare('SELECT * FROM sync_state WHERE id = 1').get() as SyncStateRow | undefined;
-    return { lastSyncAt: row?.last_sync_at ?? null, oldestDate: row?.oldest_synced_date ?? null, newestDate: row?.newest_synced_date ?? null };
-  }
+      switch (name) {
+        case 'get_today': {
+          const recovery = db.getLatestRecovery();
+          const sleep = db.getLatestSleep();
+          const cycle = db.getLatestCycle();
+          if (!recovery && !sleep && !cycle) {
+            return { content: [{ type: 'text', text: 'No data available. Try running sync_data first.' }] };
+          }
+          let response = "# Today's Whoop Summary\n\n";
+          if (recovery) {
+            response += `## Recovery: ${recovery.recovery_score ?? 'N/A'}% ${recovery.recovery_score ? getRecoveryZone(recovery.recovery_score) : ''}\n`;
+            response += `- **HRV**: ${recovery.hrv_rmssd?.toFixed(1) ?? 'N/A'} ms\n`;
+            response += `- **Resting HR**: ${recovery.resting_hr ?? 'N/A'} bpm\n`;
+            if (recovery.spo2) response += `- **SpO2**: ${recovery.spo2.toFixed(1)}%\n`;
+            if (recovery.skin_temp) response += `- **Skin Temp**: ${recovery.skin_temp.toFixed(1)}°C\n`;
+            response += '\n';
+          }
+          if (sleep) {
+            const totalSleep = (sleep.total_in_bed_milli ?? 0) - (sleep.total_awake_milli ?? 0);
+            response += `## Last Night's Sleep\n`;
+            response += `- **Total Sleep**: ${formatDuration(totalSleep)}\n`;
+            response += `- **Performance**: ${sleep.sleep_performance?.toFixed(0) ?? 'N/A'}%\n`;
+            response += `- **Efficiency**: ${sleep.sleep_efficiency?.toFixed(0) ?? 'N/A'}%\n`;
+            response += `- **Stages**: Light ${formatDuration(sleep.total_light_milli)}, Deep ${formatDuration(sleep.total_deep_milli)}, REM ${formatDuration(sleep.total_rem_milli)}\n`;
+            if (sleep.respiratory_rate) response += `- **Respiratory Rate**: ${sleep.respiratory_rate.toFixed(1)} breaths/min\n`;
+            response += '\n';
+          }
+          if (cycle) {
+            response += `## Current Strain\n`;
+            response += `- **Day Strain**: ${cycle.strain?.toFixed(1) ?? 'N/A'} ${cycle.strain ? getStrainZone(cycle.strain) : ''}\n`;
+            if (cycle.kilojoule) response += `- **Calories**: ${Math.round(cycle.kilojoule / 4.184)} kcal\n`;
+            if (cycle.avg_hr) response += `- **Avg HR**: ${cycle.avg_hr} bpm\n`;
+            if (cycle.max_hr) response += `- **Max HR**: ${cycle.max_hr} bpm\n`;
+          }
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'get_recovery_trends': {
+          const days = validateDays(typedArgs.days);
+          const trends = db.getRecoveryTrends(days);
+          if (trends.length === 0) {
+            return { content: [{ type: 'text', text: 'No recovery data available for the requested period.' }] };
+          }
+          let response = `# Recovery Trends (Last ${days} Days)\n\n`;
+          response += '| Date | Recovery | HRV | RHR |\n|------|----------|-----|-----|\n';
+          for (const day of trends) {
+            response += `| ${formatDate(day.date)} | ${day.recovery_score}% | ${day.hrv?.toFixed(1) ?? 'N/A'} ms | ${day.rhr ?? 'N/A'} bpm |\n`;
+          }
+          const avgRecovery = trends.reduce((sum, d) => sum + (d.recovery_score || 0), 0) / trends.length;
+          const avgHrv = trends.reduce((sum, d) => sum + (d.hrv || 0), 0) / trends.length;
+          const avgRhr = trends.reduce((sum, d) => sum + (d.rhr || 0), 0) / trends.length;
+          response += `\n## Averages\n- **Recovery**: ${avgRecovery.toFixed(0)}%\n- **HRV**: ${avgHrv.toFixed(1)} ms\n- **RHR**: ${avgRhr.toFixed(0)} bpm\n`;
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'get_sleep_analysis': {
+          const days = validateDays(typedArgs.days);
+          const trends = db.getSleepTrends(days);
+          if (trends.length === 0) {
+            return { content: [{ type: 'text', text: 'No sleep data available for the requested period.' }] };
+          }
+          let response = `# Sleep Analysis (Last ${days} Days)\n\n`;
+          response += '| Date | Duration | Performance | Efficiency |\n|------|----------|-------------|------------|\n';
+          for (const day of trends) {
+            response += `| ${formatDate(day.date)} | ${day.total_sleep_hours?.toFixed(1) ?? 'N/A'}h | ${day.performance?.toFixed(0) ?? 'N/A'}% | ${day.efficiency?.toFixed(0) ?? 'N/A'}% |\n`;
+          }
+          const avgDuration = trends.reduce((sum, d) => sum + (d.total_sleep_hours || 0), 0) / trends.length;
+          const avgPerf = trends.reduce((sum, d) => sum + (d.performance || 0), 0) / trends.length;
+          const avgEff = trends.reduce((sum, d) => sum + (d.efficiency || 0), 0) / trends.length;
+          response += `\n## Averages\n- **Duration**: ${avgDuration.toFixed(1)} hours\n- **Performance**: ${avgPerf.toFixed(0)}%\n- **Efficiency**: ${avgEff.toFixed(0)}%\n`;
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'get_strain_history': {
+          const days = validateDays(typedArgs.days);
+          const trends = db.getStrainTrends(days);
+          if (trends.length === 0) {
+            return { content: [{ type: 'text', text: 'No strain data available for the requested period.' }] };
+          }
+          let response = `# Strain History (Last ${days} Days)\n\n`;
+          response += '| Date | Strain | Calories |\n|------|--------|----------|\n';
+          for (const day of trends) {
+            response += `| ${formatDate(day.date)} | ${day.strain?.toFixed(1) ?? 'N/A'} | ${day.calories ?? 'N/A'} kcal |\n`;
+          }
+          const avgStrain = trends.reduce((sum, d) => sum + (d.strain || 0), 0) / trends.length;
+          const avgCalories = trends.reduce((sum, d) => sum + (d.calories || 0), 0) / trends.length;
+          response += `\n## Averages\n- **Daily Strain**: ${avgStrain.toFixed(1)}\n- **Daily Calories**: ${Math.round(avgCalories)} kcal\n`;
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'get_hr_zones': {
+          const days = validateDays(typedArgs.days);
+          const trends = db.getHrZoneTrends(days);
+          if (trends.length === 0) {
+            return { content: [{ type: 'text', text: 'No workout HR zone data available.' }] };
+          }
+          let response = `# HR Zone Distribution (Last ${days} Days)\n\nMonthly time spent in each heart rate zone (from workouts):\n\n`;
+          response += '| Month | Z0 | Z1 | Z2 | Z3 | Z4 | Z5 | Workouts | Strain |\n|-------|----|----|----|----|----|----|----|----|\n';
+          for (const m of trends) {
+            response += `| ${m.month} | ${formatDuration(m.z0)} | ${formatDuration(m.z1)} | ${formatDuration(m.z2)} | ${formatDuration(m.z3)} | ${formatDuration(m.z4)} | ${formatDuration(m.z5)} | ${m.workout_count} | ${m.total_strain} |\n`;
+          }
+          const totals = trends.reduce((acc, m) => ({
+            z0: acc.z0 + (m.z0 || 0), z1: acc.z1 + (m.z1 || 0), z2: acc.z2 + (m.z2 || 0),
+            z3: acc.z3 + (m.z3 || 0), z4: acc.z4 + (m.z4 || 0), z5: acc.z5 + (m.z5 || 0),
+            workouts: acc.workouts + (m.workout_count || 0)
+          }), { z0:0, z1:0, z2:0, z3:0, z4:0, z5:0, workouts:0 });
+          const total = totals.z0 + totals.z1 + totals.z2 + totals.z3 + totals.z4 + totals.z5;
+          const pct = (v: number) => total ? Math.round(v / total * 100) : 0;
+          response += `\n## Totals across period\n`;
+          response += `- **Z0** (rest/very low): ${formatDuration(totals.z0)} (${pct(totals.z0)}%)\n`;
+          response += `- **Z1** (very light): ${formatDuration(totals.z1)} (${pct(totals.z1)}%)\n`;
+          response += `- **Z2** (Z2 base — fat ox, mitochondrial): ${formatDuration(totals.z2)} (${pct(totals.z2)}%)\n`;
+          response += `- **Z3** (tempo/aerobic): ${formatDuration(totals.z3)} (${pct(totals.z3)}%)\n`;
+          response += `- **Z4** (threshold): ${formatDuration(totals.z4)} (${pct(totals.z4)}%)\n`;
+          response += `- **Z5** (VO2max — max effort): ${formatDuration(totals.z5)} (${pct(totals.z5)}%)\n`;
+          response += `- **Total workouts**: ${totals.workouts}\n`;
+          response += `- **Total tracked time**: ${formatDuration(total)}\n`;
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'sync_data': {
+          const tokens = db.getTokens();
+          if (!tokens) {
+            return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Use get_auth_url to authorize first.' }] };
+          }
+          client.setTokens(tokens);
+          const full = validateBoolean(typedArgs.full);
+          let stats;
+          if (full) {
+            stats = await sync.syncDays(3650);
+          } else {
+            const result = await sync.smartSync();
+            if (result.type === 'skip') {
+              return { content: [{ type: 'text', text: 'Data is already up to date (synced within the last hour).' }] };
+            }
+            stats = result.stats;
+          }
+          return { content: [{ type: 'text', text: `Sync complete!\n- Cycles: ${stats?.cycles}\n- Recoveries: ${stats?.recoveries}\n- Sleeps: ${stats?.sleeps}\n- Workouts: ${stats?.workouts}` }] };
+        }
+        case 'get_auth_url': {
+          const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
+          const url = client.getAuthorizationUrl(scopes);
+          return { content: [{ type: 'text', text: `To authorize with Whoop:\n\n1. Visit: ${url}\n2. Log in and authorize\n3. You'll be redirected back automatically\n\nRedirect URI: ${config.redirectUri}` }] };
+        }
+        default:
+          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+    }
+  });
 
-  updateSyncState(oldestDate: string, newestDate: string): void {
-    this.db.prepare(`UPDATE sync_state SET last_sync_at = CURRENT_TIMESTAMP, oldest_synced_date = COALESCE(CASE WHEN oldest_synced_date IS NULL OR ? < oldest_synced_date THEN ? ELSE oldest_synced_date END, ?), newest_synced_date = COALESCE(CASE WHEN newest_synced_date IS NULL OR ? > newest_synced_date THEN ? ELSE newest_synced_date END, ?) WHERE id = 1`).run(oldestDate, oldestDate, oldestDate, newestDate, newestDate, newestDate);
-  }
+  return server;
+}
 
-  upsertCycles(cycles: WhoopCycle[]): void {
-    const stmt = this.db.prepare(`INSERT OR REPLACE INTO cycles (id, user_id, start_time, end_time, score_state, strain, kilojoule, avg_hr, max_hr, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`);
-    const insertMany = this.db.transaction((items: WhoopCycle[]) => {
-      for (const c of items) {
-        stmt.run(c.id, c.user_id, c.start, c.end, c.score_state, c.score?.strain ?? null, c.score?.kilojoule ?? null, c.score?.average_heart_rate ?? null, c.score?.max_heart_rate ?? null);
+async function main(): Promise<void> {
+  if (config.mode === 'stdio') {
+    const server = createMcpServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write('Whoop MCP server running on stdio\n');
+  } else {
+    const app = express();
+
+    app.get('/callback', async (req: Request, res: Response) => {
+      const code = req.query.code as string | undefined;
+      if (!code) {
+        res.status(400).send('Missing authorization code');
+        return;
+      }
+      try {
+        const tokens = await client.exchangeCodeForTokens(code);
+        db.saveTokens(tokens);
+        sync.syncDays(90).catch(() => {});
+        res.send('Authorization successful! You can close this window.');
+      } catch {
+        res.status(500).send('Authorization failed. Please try again.');
       }
     });
-    insertMany(cycles);
-  }
 
-  upsertRecoveries(recoveries: WhoopRecovery[]): void {
-    const stmt = this.db.prepare(`INSERT OR REPLACE INTO recovery (id, user_id, sleep_id, created_at, score_state, recovery_score, resting_hr, hrv_rmssd, spo2, skin_temp, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`);
-    const insertMany = this.db.transaction((items: WhoopRecovery[]) => {
-      for (const r of items) {
-        stmt.run(r.cycle_id, r.user_id, r.sleep_id, r.created_at, r.score_state, r.score?.recovery_score ?? null, r.score?.resting_heart_rate ?? null, r.score?.hrv_rmssd_milli ?? null, r.score?.spo2_percentage ?? null, r.score?.skin_temp_celsius ?? null);
-      }
+    app.get('/health', (_req: Request, res: Response) => {
+      res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
     });
-    insertMany(recoveries);
-  }
 
-  upsertSleeps(sleeps: WhoopSleep[]): void {
-    const stmt = this.db.prepare(`INSERT OR REPLACE INTO sleep (id, user_id, start_time, end_time, is_nap, score_state, total_in_bed_milli, total_awake_milli, total_light_milli, total_deep_milli, total_rem_milli, sleep_performance, sleep_efficiency, sleep_consistency, respiratory_rate, sleep_needed_baseline_milli, sleep_needed_debt_milli, sleep_needed_strain_milli, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`);
-    const insertMany = this.db.transaction((items: WhoopSleep[]) => {
-      for (const s of items) {
-        stmt.run(s.id, s.user_id, s.start, s.end, s.nap ? 1 : 0, s.score_state, s.score?.stage_summary?.total_in_bed_time_milli ?? null, s.score?.stage_summary?.total_awake_time_milli ?? null, s.score?.stage_summary?.total_light_sleep_time_milli ?? null, s.score?.stage_summary?.total_slow_wave_sleep_time_milli ?? null, s.score?.stage_summary?.total_rem_sleep_time_milli ?? null, s.score?.sleep_performance_percentage ?? null, s.score?.sleep_efficiency_percentage ?? null, s.score?.sleep_consistency_percentage ?? null, s.score?.respiratory_rate ?? null, s.score?.sleep_needed?.baseline_milli ?? null, s.score?.sleep_needed?.need_from_sleep_debt_milli ?? null, s.score?.sleep_needed?.need_from_recent_strain_milli ?? null);
+    app.all('/mcp', async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
+        const session = transports.get(sessionId)!;
+        await session.transport.close();
+        transports.delete(sessionId);
+        res.status(200).send('Session closed');
+        return;
       }
-    });
-    insertMany(sleeps);
-  }
-
-  upsertWorkouts(workouts: WhoopWorkout[]): void {
-    const stmt = this.db.prepare(`INSERT OR REPLACE INTO workouts (id, user_id, sport_id, start_time, end_time, score_state, strain, avg_hr, max_hr, kilojoule, zone_zero_milli, zone_one_milli, zone_two_milli, zone_three_milli, zone_four_milli, zone_five_milli, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`);
-    const insertMany = this.db.transaction((items: WhoopWorkout[]) => {
-      for (const w of items) {
-        stmt.run(w.id, w.user_id, w.sport_id, w.start, w.end, w.score_state, w.score?.strain ?? null, w.score?.average_heart_rate ?? null, w.score?.max_heart_rate ?? null, w.score?.kilojoule ?? null, w.score?.zone_duration?.zone_zero_milli ?? null, w.score?.zone_duration?.zone_one_milli ?? null, w.score?.zone_duration?.zone_two_milli ?? null, w.score?.zone_duration?.zone_three_milli ?? null, w.score?.zone_duration?.zone_four_milli ?? null, w.score?.zone_duration?.zone_five_milli ?? null);
+      if (req.method === 'POST') {
+        let transport: StreamableHTTPServerTransport;
+        if (sessionId && transports.has(sessionId)) {
+          const session = transports.get(sessionId)!;
+          session.lastAccess = Date.now();
+          transport = session.transport;
+        } else if (sessionId) {
+          res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+          return;
+        } else {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => crypto.randomUUID(),
+            onsessioninitialized: newSessionId => {
+              transports.set(newSessionId, { transport, lastAccess: Date.now() });
+            },
+          });
+          const server = createMcpServer();
+          await server.connect(transport);
+        }
+        await transport.handleRequest(req, res);
+        return;
       }
+      res.status(405).send('Method not allowed');
     });
-    insertMany(workouts);
-  }
 
-  getLatestCycle(): DbCycle | null {
-    return this.db.prepare('SELECT * FROM cycles ORDER BY start_time DESC LIMIT 1').get() as DbCycle | undefined ?? null;
-  }
-  getLatestRecovery(): DbRecovery | null {
-    return this.db.prepare('SELECT * FROM recovery ORDER BY created_at DESC LIMIT 1').get() as DbRecovery | undefined ?? null;
-  }
-  getLatestSleep(): DbSleep | null {
-    return this.db.prepare('SELECT * FROM sleep WHERE is_nap = 0 ORDER BY start_time DESC LIMIT 1').get() as DbSleep | undefined ?? null;
-  }
-  getCyclesByDateRange(startDate: string, endDate: string): DbCycle[] {
-    return this.db.prepare(`SELECT * FROM cycles WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC`).all(startDate, endDate) as DbCycle[];
-  }
-  getRecoveriesByDateRange(startDate: string, endDate: string): DbRecovery[] {
-    return this.db.prepare(`SELECT * FROM recovery WHERE created_at >= ? AND created_at <= ? ORDER BY created_at DESC`).all(startDate, endDate) as DbRecovery[];
-  }
-  getSleepsByDateRange(startDate: string, endDate: string, includeNaps = false): DbSleep[] {
-    const query = includeNaps ? 'SELECT * FROM sleep WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC' : 'SELECT * FROM sleep WHERE start_time >= ? AND start_time <= ? AND is_nap = 0 ORDER BY start_time DESC';
-    return this.db.prepare(query).all(startDate, endDate) as DbSleep[];
-  }
-  getWorkoutsByDateRange(startDate: string, endDate: string): DbWorkout[] {
-    return this.db.prepare(`SELECT * FROM workouts WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC`).all(startDate, endDate) as DbWorkout[];
-  }
+    app.get('/sse', (_req: Request, res: Response) => {
+      res.status(410).send('SSE endpoint deprecated. Use /mcp with Streamable HTTP transport.');
+    });
 
-  getRecoveryTrends(days: number): RecoveryTrendRow[] {
-    return this.db.prepare(`SELECT DATE(created_at) as date, recovery_score, hrv_rmssd as hrv, resting_hr as rhr FROM recovery WHERE recovery_score IS NOT NULL AND created_at >= DATE('now', '-' || ? || ' days') ORDER BY created_at DESC`).all(days) as RecoveryTrendRow[];
-  }
+    const server = app.listen(config.port, '0.0.0.0', () => {
+      process.stdout.write(`Whoop MCP server running on http://0.0.0.0:${config.port}\n`);
+    });
 
-  getSleepTrends(days: number): SleepTrendRow[] {
-    return this.db.prepare(`SELECT DATE(start_time) as date, ROUND((total_in_bed_milli - total_awake_milli) / 3600000.0, 2) as total_sleep_hours, sleep_performance as performance, sleep_efficiency as efficiency FROM sleep WHERE is_nap = 0 AND sleep_performance IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days') ORDER BY start_time DESC`).all(days) as SleepTrendRow[];
-  }
-
-  getStrainTrends(days: number): StrainTrendRow[] {
-    return this.db.prepare(`SELECT DATE(start_time) as date, strain, ROUND(kilojoule / 4.184, 0) as calories FROM cycles WHERE strain IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days') ORDER BY start_time DESC`).all(days) as StrainTrendRow[];
-  }
-
-  getHrZoneTrends(days: number): HrZoneTrendRow[] {
-    return this.db.prepare(`SELECT strftime('%Y-%m', start_time) as month, SUM(COALESCE(zone_zero_milli, 0)) as z0, SUM(COALESCE(zone_one_milli, 0)) as z1, SUM(COALESCE(zone_two_milli, 0)) as z2, SUM(COALESCE(zone_three_milli, 0)) as z3, SUM(COALESCE(zone_four_milli, 0)) as z4, SUM(COALESCE(zone_five_milli, 0)) as z5, COUNT(*) as workout_count, ROUND(SUM(COALESCE(strain, 0)), 1) as total_strain FROM workouts WHERE start_time >= DATE('now', '-' || ? || ' days') GROUP BY month ORDER BY month ASC`).all(days) as HrZoneTrendRow[];
-  }
-
-  close(): void {
-    this.db.close();
+    const shutdown = (): void => {
+      process.stdout.write('\nShutting down...\n');
+      for (const [, session] of transports) {
+        session.transport.close().catch(() => {});
+      }
+      transports.clear();
+      db.close();
+      server.close(() => process.exit(0));
+    };
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
   }
 }
+
+main().catch(error => {
+  process.stderr.write(`Fatal error: ${error}\n`);
+  process.exit(1);
+});
