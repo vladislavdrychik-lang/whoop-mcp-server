@@ -396,7 +396,41 @@ export class WhoopDatabase {
 			ORDER BY start_time DESC
 		`).all(days) as StrainTrendRow[];
 	}
+  getHrZonesSummary(days: number): any {
+	      const row = this.db.prepare(`
+		        SELECT
+				        COALESCE(SUM(zone_zero_milli), 0) as zone0,
+						        COALESCE(SUM(zone_one_milli), 0) as zone1,
+								        COALESCE(SUM(zone_two_milli), 0) as zone2,
+										        COALESCE(SUM(zone_three_milli), 0) as zone3,
+												        COALESCE(SUM(zone_four_milli), 0) as zone4,
+														        COALESCE(SUM(zone_five_milli), 0) as zone5,
+																        COUNT(*) as totalWorkouts
+																		      FROM workouts
+																			        WHERE start_time >= DATE('now', '-' || ? || ' days')
+																					    `).get(days) as any;
+	      row.totalDurationMs = (row.zone0 || 0) + (row.zone1 || 0) + (row.zone2 || 0) + (row.zone3 || 0) + (row.zone4 || 0) + (row.zone5 || 0);
+	      return row;
+  }
 
+	  getHrZonesMonthly(days: number): any[] {
+		      return this.db.prepare(`
+			        SELECT
+					        strftime('%Y-%m', start_time) as month,
+							        COALESCE(SUM(zone_zero_milli), 0) as zone0,
+									        COALESCE(SUM(zone_one_milli), 0) as zone1,
+											        COALESCE(SUM(zone_two_milli), 0) as zone2,
+													        COALESCE(SUM(zone_three_milli), 0) as zone3,
+															        COALESCE(SUM(zone_four_milli), 0) as zone4,
+																	        COALESCE(SUM(zone_five_milli), 0) as zone5,
+																			        COUNT(*) as workouts
+																					      FROM workouts
+																						        WHERE start_time >= DATE('now', '-' || ? || ' days')
+																								      GROUP BY strftime('%Y-%m', start_time)
+																									        ORDER BY month
+																											    `).all(days) as any[];
+	  }
+	
 	close(): void {
 		this.db.close();
 	}
