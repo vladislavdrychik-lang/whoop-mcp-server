@@ -106,12 +106,13 @@ function validateBoolean(value: unknown): boolean {
 }
 
 function createMcpServer(): Server {
-  const server = new Server({ name: 'whoop-mcp-server', version: '1.0.0' }, { capabilities: { tools: {} } });
+  const server = new Server({ name: 'whoop-mcp-server', version: '1.1.0' }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       { name: 'get_today', description: "Get today's Whoop data including recovery score, last night's sleep, and current strain.", inputSchema: { type: 'object', properties: {}, required: [] } },
       { name: 'get_recovery_trends', description: 'Get recovery score trends over time, including HRV and resting heart rate patterns.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
       { name: 'get_sleep_analysis', description: 'Get detailed sleep analysis including duration, stages, efficiency, and sleep debt.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
+      { name: 'get_sleep_detailed', description: 'Get sleep with all stages broken down: in-bed, asleep, awake, light, deep, REM in minutes — for accurate % calculations matching Whoop app exactly.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
       { name: 'get_strain_history', description: 'Get training strain history and workout data.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 3650)' } }, required: [] } },
       { name: 'get_hr_zones', description: 'Get monthly HR zone time distribution (Z0-Z5) from workouts. Critical for VO2max + Z2 base analysis.', inputSchema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to analyze (default: 90, max: 3650)' } }, required: [] } },
       { name: 'sync_data', description: 'Manually trigger a data sync from Whoop.', inputSchema: { type: 'object', properties: { full: { type: 'boolean', description: 'Force a full historical sync (default: false)' } }, required: [] } },
@@ -130,7 +131,7 @@ function createMcpServer(): Server {
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as ToolArguments;
     try {
-      const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history', 'get_hr_zones'];
+      const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_sleep_detailed', 'get_strain_history', 'get_hr_zones'];
       if (dataTools.includes(name)) {
         const tokens = db.getTokens();
         if (!tokens) {
@@ -152,7 +153,7 @@ function createMcpServer(): Server {
             response += `- **HRV**: ${recovery.hrv_rmssd?.toFixed(1) ?? 'N/A'} ms\n`;
             response += `- **Resting HR**: ${recovery.resting_hr ?? 'N/A'} bpm\n`;
             if (recovery.spo2) response += `- **SpO2**: ${recovery.spo2.toFixed(1)}%\n`;
-            if (recovery.skin_temp) response += `- **Skin Temp**: ${recovery.skin_temp.toFixed(1)}°C\n`;
+            if (recovery.skin_temp) response += `- **Skin Temp**: ${recovery.skin_temp.toFixed(1)}Â°C\n`;
             response += '\n';
           }
           if (sleep) {
@@ -191,6 +192,14 @@ function createMcpServer(): Server {
           const avgPerf = trends.reduce((s, d) => s + (d.performance || 0), 0) / trends.length;
           const avgEff = trends.reduce((s, d) => s + (d.efficiency || 0), 0) / trends.length;
           response += `\n## Averages\n- **Duration**: ${avgDuration.toFixed(1)} hours\n- **Performance**: ${avgPerf.toFixed(0)}%\n- **Efficiency**: ${avgEff.toFixed(0)}%\n`;
+          return { content: [{ type: 'text', text: response }] };
+        }
+        case 'get_sleep_detailed': {
+          const days = validateDays(typedArgs.days);
+          const trends = db.getSleepDetailedTrends(days);
+          if (trends.length === 0) return { content: [{ type: 'text', text: 'No detailed sleep data available for the requested period.' }] };
+          let response = `# Sleep Detailed (Last ${days} Days)\n\nAll stage durations in minutes. Asleep = In-bed − Awake. % = stage / In-bed × 100 (matches Whoop app).\n\n| Date | In-bed | Asleep | Awake | Light | Deep | REM | Perf% | Eff% | RR |\n|------|--------|--------|-------|-------|------|-----|-------|------|-----|\n`;
+          for (const d of trends) response += `| ${formatDate(d.date)} | ${d.in_bed_minutes} | ${d.asleep_minutes} | ${d.awake_minutes} | ${d.light_minutes} | ${d.deep_minutes} | ${d.rem_minutes} | ${d.performance?.toFixed(0) ?? 'N/A'} | ${d.efficiency?.toFixed(0) ?? 'N/A'} | ${d.respiratory_rate?.toFixed(1) ?? 'N/A'} |\n`;
           return { content: [{ type: 'text', text: response }] };
         }
         case 'get_strain_history': {
@@ -343,7 +352,7 @@ async function main(): Promise<void> {
         const tokens = await withingsClient.exchangeCodeForTokens(code);
         db.saveWithingsTokens(tokens);
         const result = await withingsSync.syncBodyMeasurements();
-        res.send(`<html><body style="font-family:sans-serif;padding:24px;"><h2>Withings connected ✓</h2><p>User ID: ${tokens.user_id}</p><p>Initial sync: ${result.inserted} measurements imported.</p><p>Latest: ${result.latest ? new Date(result.latest * 1000).toLocaleString() : 'n/a'}</p><p>You can close this tab.</p></body></html>`);
+        res.send(`<html><body style="font-family:sans-serif;padding:24px;"><h2>Withings connected â</h2><p>User ID: ${tokens.user_id}</p><p>Initial sync: ${result.inserted} measurements imported.</p><p>Latest: ${result.latest ? new Date(result.latest * 1000).toLocaleString() : 'n/a'}</p><p>You can close this tab.</p></body></html>`);
       } catch (e: any) {
         res.status(500).send(`Withings auth failed: ${e.message}`);
       }
@@ -360,7 +369,7 @@ async function main(): Promise<void> {
         const tokens = await stravaClient.exchangeCodeForTokens(code);
         db.saveStravaTokens(tokens);
         const result = await stravaSync.syncActivities();
-        res.send(`<html><body style="font-family:sans-serif;padding:24px;"><h2>Strava connected ✓</h2><p>Athlete ID: ${tokens.athlete_id}</p><p>Initial sync: ${result.inserted} activities imported.</p><p>Latest: ${result.latest || 'n/a'}</p><p>You can close this tab.</p></body></html>`);
+        res.send(`<html><body style="font-family:sans-serif;padding:24px;"><h2>Strava connected â</h2><p>Athlete ID: ${tokens.athlete_id}</p><p>Initial sync: ${result.inserted} activities imported.</p><p>Latest: ${result.latest || 'n/a'}</p><p>You can close this tab.</p></body></html>`);
       } catch (e: any) {
         res.status(500).send(`Strava auth failed: ${e.message}`);
       }
