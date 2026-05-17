@@ -18,6 +18,7 @@ interface TokenRow { id: number; access_token: string; refresh_token: string; ex
 interface SyncStateRow { id: number; last_sync_at: string | null; oldest_synced_date: string | null; newest_synced_date: string | null; }
 interface RecoveryTrendRow { date: string; recovery_score: number; hrv: number; rhr: number; }
 interface SleepTrendRow { date: string; total_sleep_hours: number; performance: number; efficiency: number; }
+interface SleepDetailedRow { date: string; in_bed_minutes: number; asleep_minutes: number; awake_minutes: number; light_minutes: number; deep_minutes: number; rem_minutes: number; performance: number; efficiency: number; respiratory_rate: number | null; }
 interface StrainTrendRow { date: string; strain: number; calories: number; }
 interface HrZoneTrendRow { month: string; z0: number; z1: number; z2: number; z3: number; z4: number; z5: number; workout_count: number; total_strain: number; }
 interface WithingsTokenRow { id: number; access_token: string; refresh_token: string; expires_at: number; user_id: number; scope: string | null; }
@@ -293,6 +294,10 @@ export class WhoopDatabase {
 
   getSleepTrends(days: number): SleepTrendRow[] {
     return this.db.prepare(`SELECT DATE(start_time) as date, ROUND((total_in_bed_milli - total_awake_milli) / 3600000.0, 2) as total_sleep_hours, sleep_performance as performance, sleep_efficiency as efficiency FROM sleep WHERE is_nap = 0 AND sleep_performance IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days') ORDER BY start_time DESC`).all(days) as SleepTrendRow[];
+  }
+
+  getSleepDetailedTrends(days: number): SleepDetailedRow[] {
+    return this.db.prepare(`SELECT DATE(start_time) as date, ROUND(total_in_bed_milli / 60000.0) as in_bed_minutes, ROUND((total_in_bed_milli - total_awake_milli) / 60000.0) as asleep_minutes, ROUND(total_awake_milli / 60000.0) as awake_minutes, ROUND(total_light_milli / 60000.0) as light_minutes, ROUND(total_deep_milli / 60000.0) as deep_minutes, ROUND(total_rem_milli / 60000.0) as rem_minutes, sleep_performance as performance, sleep_efficiency as efficiency, respiratory_rate FROM sleep WHERE is_nap = 0 AND total_in_bed_milli IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days') ORDER BY start_time DESC`).all(days) as SleepDetailedRow[];
   }
 
   getStrainTrends(days: number): StrainTrendRow[] {
