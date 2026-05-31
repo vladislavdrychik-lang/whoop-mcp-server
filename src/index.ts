@@ -106,7 +106,7 @@ function validateBoolean(value: unknown): boolean {
 }
 
 function createMcpServer(): Server {
-  const server = new Server({ name: 'whoop-mcp-server', version: '1.1.0' }, { capabilities: { tools: {} } });
+  const server = new Server({ name: 'health-data-mcp', version: '1.1.1' }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       { name: 'get_today', description: "Get today's Whoop data including recovery score, last night's sleep, and current strain.", inputSchema: { type: 'object', properties: {}, required: [] } },
