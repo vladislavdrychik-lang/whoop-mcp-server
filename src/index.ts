@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
 import { timingSafeEqual } from 'node:crypto';
+import { getMcpAccessToken } from './secrets.js';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -380,12 +381,13 @@ async function main(): Promise<void> {
       res.json({ status: 'ok', authenticated: Boolean(db.getTokens()), withings_authenticated: Boolean(db.getWithingsTokens()), strava_authenticated: Boolean(db.getStravaTokens()) });
     });
 
-    // /mcp is protected by MCP_ACCESS_TOKEN. Pass it either as the last path segment
-    // (https://host/mcp/<token> — for clients that can't set headers, e.g. Claude custom
-    // connectors) or as "Authorization: Bearer <token>". Without the variable the endpoint
-    // stays closed, so a public domain never exposes health data by accident.
-    const mcpToken = process.env.MCP_ACCESS_TOKEN ?? '';
-    if (!mcpToken) process.stderr.write('MCP_ACCESS_TOKEN is not set: /mcp will reject all requests.\n');
+    // /mcp is protected by an access token: MCP_ACCESS_TOKEN, or one the server generates and
+    // stores on the volume (printed once per start as the connector URL). Pass it as the last
+    // path segment (https://host/mcp/<token>, for Claude custom connectors) or as
+    // "Authorization: Bearer <token>".
+    const mcpToken = getMcpAccessToken();
+    const publicHost = process.env.RAILWAY_PUBLIC_DOMAIN ?? `localhost:${config.port}`;
+    process.stdout.write(`Connector URL (keep private): https://${publicHost}/mcp/${mcpToken}\n`);
     const tokenMatches = (candidate: string | undefined): boolean => {
       if (!mcpToken || !candidate) return false;
       const a = Buffer.from(candidate);

@@ -1,3 +1,4 @@
+import { getEncryptionSecret } from './secrets.js';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
 
 const ALGORITHM = 'aes-256-gcm';
@@ -5,10 +6,9 @@ const KEY_LENGTH = 32;
 const IV_LENGTH = 16;
 
 function getEncryptionKey(): Buffer {
-	const secret = process.env.ENCRYPTION_SECRET || process.env.WHOOP_CLIENT_SECRET;
-	if (!secret) {
-		throw new Error('No encryption secret available');
-	}
+	// ENCRYPTION_SECRET env var, else a server-generated secret stored on the volume.
+	// Deliberately independent of WHOOP_CLIENT_SECRET so rotating it doesn't wipe tokens.
+	const secret = getEncryptionSecret();
 	const salt = Buffer.from('whoop-mcp-token-encryption', 'utf8');
 	return scryptSync(secret, salt, KEY_LENGTH);
 }
