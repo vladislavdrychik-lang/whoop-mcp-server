@@ -86,6 +86,8 @@ npm run dev
 | `WHOOP_CLIENT_ID` | Whoop OAuth client ID | Required |
 | `WHOOP_CLIENT_SECRET` | Whoop OAuth client secret | Required |
 | `WHOOP_REDIRECT_URI` | OAuth callback URL | `http://localhost:3000/callback` |
+| `MCP_ACCESS_TOKEN` | Required in HTTP mode. Long random string; connect with `https://<host>/mcp/<token>` or `Authorization: Bearer <token>`. Without it `/mcp` returns 503. | — |
+| `ENCRYPTION_SECRET` | Key for encrypting stored OAuth tokens. Set it so rotating `WHOOP_CLIENT_SECRET` doesn't invalidate tokens. | `WHOOP_CLIENT_SECRET` |
 | `DB_PATH` | SQLite database path | `./whoop.db` |
 | `PORT` | HTTP server port | `3000` |
 | `MCP_MODE` | `http` for remote, `stdio` for local | `http` |

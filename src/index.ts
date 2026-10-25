@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -379,7 +380,26 @@ async function main(): Promise<void> {
       res.json({ status: 'ok', authenticated: Boolean(db.getTokens()), withings_authenticated: Boolean(db.getWithingsTokens()), strava_authenticated: Boolean(db.getStravaTokens()) });
     });
 
-    app.all('/mcp', async (req: Request, res: Response) => {
+    // /mcp is protected by MCP_ACCESS_TOKEN. Pass it either as the last path segment
+    // (https://host/mcp/<token> — for clients that can't set headers, e.g. Claude custom
+    // connectors) or as "Authorization: Bearer <token>". Without the variable the endpoint
+    // stays closed, so a public domain never exposes health data by accident.
+    const mcpToken = process.env.MCP_ACCESS_TOKEN ?? '';
+    if (!mcpToken) process.stderr.write('MCP_ACCESS_TOKEN is not set: /mcp will reject all requests.\n');
+    const tokenMatches = (candidate: string | undefined): boolean => {
+      if (!mcpToken || !candidate) return false;
+      const a = Buffer.from(candidate);
+      const b = Buffer.from(mcpToken);
+      return a.length === b.length && timingSafeEqual(a, b);
+    };
+    const requireMcpToken = (req: Request, res: Response, next: () => void): void => {
+      const header = req.headers.authorization;
+      const bearer = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+      if (tokenMatches(req.params.token) || tokenMatches(bearer)) { next(); return; }
+      res.status(mcpToken ? 401 : 503).json({ jsonrpc: '2.0', error: { code: -32001, message: mcpToken ? 'Unauthorized' : 'Server not configured: MCP_ACCESS_TOKEN missing' }, id: null });
+    };
+
+    app.all(['/mcp', '/mcp/:token'], requireMcpToken, async (req: Request, res: Response) => {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
         const session = transports.get(sessionId)!;
