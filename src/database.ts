@@ -1,5 +1,19 @@
 import Database from 'better-sqlite3';
 import { encrypt, decrypt, isEncrypted } from './crypto.js';
+
+// Tokens are encrypted with a key derived from ENCRYPTION_SECRET (or WHOOP_CLIENT_SECRET).
+// After that secret is rotated, stored tokens can no longer be decrypted. Treat them as
+// absent so the server still starts and the user can re-authorize, instead of crashing.
+function decodeTokenPair(access: string, refresh: string): { accessToken: string; refreshToken: string } | null {
+  try {
+    const accessToken = isEncrypted(access) ? decrypt(access) : access;
+    const refreshToken = isEncrypted(refresh) ? decrypt(refresh) : refresh;
+    return { accessToken, refreshToken };
+  } catch (err) {
+    console.warn('Stored tokens could not be decrypted (encryption secret changed?). Re-authorization required.');
+    return null;
+  }
+}
 import type {
   WhoopTokens,
   WhoopCycle,
@@ -186,8 +200,9 @@ export class WhoopDatabase {
   getTokens(): WhoopTokens | null {
     const row = this.db.prepare('SELECT * FROM tokens WHERE id = 1').get() as TokenRow | undefined;
     if (!row) return null;
-    const accessToken = isEncrypted(row.access_token) ? decrypt(row.access_token) : row.access_token;
-    const refreshToken = isEncrypted(row.refresh_token) ? decrypt(row.refresh_token) : row.refresh_token;
+    const decoded = decodeTokenPair(row.access_token, row.refresh_token);
+    if (!decoded) return null;
+    const { accessToken, refreshToken } = decoded;
     return { access_token: accessToken, refresh_token: refreshToken, expires_at: row.expires_at };
   }
 
@@ -200,8 +215,9 @@ export class WhoopDatabase {
   getWithingsTokens(): WithingsTokens | null {
     const row = this.db.prepare('SELECT * FROM withings_tokens WHERE id = 1').get() as WithingsTokenRow | undefined;
     if (!row) return null;
-    const accessToken = isEncrypted(row.access_token) ? decrypt(row.access_token) : row.access_token;
-    const refreshToken = isEncrypted(row.refresh_token) ? decrypt(row.refresh_token) : row.refresh_token;
+    const decoded = decodeTokenPair(row.access_token, row.refresh_token);
+    if (!decoded) return null;
+    const { accessToken, refreshToken } = decoded;
     return { access_token: accessToken, refresh_token: refreshToken, expires_at: row.expires_at, user_id: row.user_id, scope: row.scope ?? '' };
   }
 
@@ -318,8 +334,9 @@ export class WhoopDatabase {
   getStravaTokens(): StravaTokens | null {
     const row = this.db.prepare('SELECT * FROM strava_tokens WHERE id = 1').get() as StravaTokenRow | undefined;
     if (!row) return null;
-    const accessToken = isEncrypted(row.access_token) ? decrypt(row.access_token) : row.access_token;
-    const refreshToken = isEncrypted(row.refresh_token) ? decrypt(row.refresh_token) : row.refresh_token;
+    const decoded = decodeTokenPair(row.access_token, row.refresh_token);
+    if (!decoded) return null;
+    const { accessToken, refreshToken } = decoded;
     return { access_token: accessToken, refresh_token: refreshToken, expires_at: row.expires_at, athlete_id: row.athlete_id, scope: row.scope ?? '' };
   }
 
