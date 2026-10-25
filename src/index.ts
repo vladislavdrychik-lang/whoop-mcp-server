@@ -338,8 +338,10 @@ async function main(): Promise<void> {
         db.saveTokens(tokens);
         sync.syncDays(90).catch(() => {});
         res.send('Authorization successful! You can close this window.');
-      } catch {
-        res.status(500).send('Authorization failed. Please try again.');
+      } catch (e: any) {
+        const message = String(e?.message ?? e).slice(0, 500);
+        process.stderr.write(`Whoop authorization failed: ${message}\n`);
+        res.status(500).type('text/plain').send(`Authorization failed: ${message}`);
       }
     });
 
